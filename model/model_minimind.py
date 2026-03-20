@@ -6,6 +6,13 @@ from transformers import PretrainedConfig
 
 
 class MiniMindConfig(PretrainedConfig):
+    """MiniMind 解码器-only 因果语言模型的超参配置。
+
+    继承 ``Transformers.PretrainedConfig``，可与 ``config.json``、``from_pretrained`` 等生态对齐；
+    ``model_type`` 固定为 ``"minimind"`` 供注册与识别。结构为：词嵌入 → N 层 Transformer Decoder
+    （RMSNorm + RoPE 多头注意力 + SwiGLU 类前馈，可选 MoE）→ RMSNorm；适用于预训练 / SFT / RLHF 等。
+    """
+
     model_type = "minimind"
 
     def __init__(
@@ -39,6 +46,30 @@ class MiniMindConfig(PretrainedConfig):
             norm_topk_prob: bool = True,
             **kwargs
     ):
+        """
+        Args:
+            dropout: 注意力与 MLP 上的 Dropout 概率。
+            bos_token_id / eos_token_id: 句首/句末特殊 token，需与分词器一致。
+            hidden_act: 前馈层激活（键名对应 ``transformers.activations.ACT2FN``，默认 SiLU/SwiGLU 分支中用）。
+            hidden_size: 隐藏维度 d_model。
+            intermediate_size: FFN 中间层宽度；``None`` 时按 hidden 自动推导并对齐到 64 倍数。
+            max_position_embeddings: RoPE 预计算的最大序列位置长度（非训练截断长度上限的唯一约束）。
+            num_attention_heads: 查询头数 Q。
+            num_hidden_layers: Decoder 层数。
+            num_key_value_heads: KV 头数（GQA）；小于 Q 头数时可减少 K/V 投影参数量与缓存。
+            vocab_size: 词表大小，需与 ``tokenizer`` 一致。
+            rms_norm_eps: RMSNorm 中的数值稳定项。
+            rope_theta: RoPE 底数（与 LLaMA 系类似，影响长程位置编码频率）。
+            inference_rope_scaling: 为 True 时启用 YaRN 式 ``rope_scaling``，用于推理阶段更长上下文外推。
+            flash_attn: 是否优先使用 ``scaled_dot_product_attention`` 的因果 Flash 路径（需 PyTorch 2.x 等条件）。
+            use_moe: 是否将各层 FFN 替换为 MoE（混合专家）。
+            num_experts_per_tok: 每个 token 路由到的专家数 top-k。
+            n_routed_experts / n_shared_experts: 可路由专家总数 / 始终激活的共享专家模块数量。
+            scoring_func: 门控对专家分数的归一化方式（当前实现支持 ``softmax``）。
+            aux_loss_alpha: MoE 负载均衡等辅助损失的系数；训练时与 CE 相加。
+            seq_aux: 辅助损失是否在序列维度聚合（与 token 级负载统计两种风格）。
+            norm_topk_prob: top-k 路由权重是否在归一化前按维度重新归一。
+        """
         super().__init__(**kwargs)
         self.dropout = dropout
         self.bos_token_id = bos_token_id
@@ -425,12 +456,21 @@ class MiniMindModel(nn.Module):
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    """MiniMind 因果语言模型入口：底层为 ``MiniMindModel`` + 线性 ``lm_head``。
+
+    - **权重绑定**：``embed_tokens`` 与 ``lm_head`` 共用同一张嵌入矩阵，减少参数量并与常见 LLaMA 系做法一致。
+    - **训练**：传入 ``labels`` 时计算 next-token 交叉熵；``labels`` 中为 ``-100`` 的位置不参与 loss（如 SFT 中非 assistant 段）。
+    - **MoE**：各层 ``aux_loss`` 在 ``MiniMindModel`` 内汇总，写入返回的 ``output.aux_loss``；训练脚本里通常 ``loss = ce + aux_loss``。
+    - **生成**：``GenerationMixin`` 提供 ``generate`` 等接口；``use_cache`` / ``past_key_values`` 用于 KV Cache 自回归解码。
+    """
+
     config_class = MiniMindConfig
 
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
+        # 输出词分布的线性层；与 embed_tokens 共享权重（input/output embedding tie）
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
 
@@ -442,6 +482,20 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
+        """
+        Args:
+            input_ids: ``(batch, seq)`` token id；与 ``attention_mask`` 同形可选。
+            attention_mask: ``1`` 表示参与注意力的位置；因果注意力仍保持下三角掩码。
+            labels: 与 ``input_ids`` 同形；仅当提供了该张量时才计算 ``loss``。对齐标准 CLM：预测 ``t+1`` 时标签在 ``t`` 位置。
+            past_key_values: 每层 ``(k, v)`` 的缓存列表，用于增量解码。
+            use_cache: 是否在 ``forward`` 中返回并填充 KV cache（生成时常开）。
+            logits_to_keep: 整数时表示只保留 hidden 序列最后若干步再过 ``lm_head``，用于减少生成步计算；
+                也可为索引张量（与 HF 新接口对齐）。
+
+        Returns:
+            ``CausalLMOutputWithPast``：含 ``loss``（可选）、``logits``、``past_key_values``、``hidden_states``；
+            额外属性 ``aux_loss`` 在 MoE 时非零，Dense 时一般为 0。
+        """
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -454,6 +508,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            # 标准因果 LM：logits[i] 预测 token[i+1]，故与 labels 错位对齐
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
